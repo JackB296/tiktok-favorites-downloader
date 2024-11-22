@@ -10,12 +10,12 @@ from moviepy.editor import ImageSequenceClip, AudioFileClip, concatenate_audiocl
 from PIL import Image
 
 # Configuration
-COBALT_API_URL = "https://kityune.imput.net/api/json"
+COBALT_API_URL = "http://localhost:9000/"
 HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json"
 }
-RETRY_DELAY = 5  # Seconds between each download attempt
+RETRY_DELAY = 0.5  # Seconds between each download attempt
 DOWNLOAD_DIR = "downloads"  # Directory to download videos
 IMG_DIR = "img_dir"  # Temporary directory for creating slideshows
 LAST_DOWNLOADED_LINK_FILE = "last_downloaded_link.txt"  # File to store the last downloaded link
@@ -29,17 +29,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 def create_payload(url):
     return {
         "url": url,
-        "vCodec": "h264",
-        "vQuality": "720",
-        "aFormat": "mp3",
-        "filenamePattern": "classic",
-        "isAudioOnly": False,
-        "isTTFullAudio": False,
-        "isAudioMuted": False,
-        "dubLang": False,
-        "disableMetadata": False,
-        "twitterGif": False,
-        "tiktokH265": False
+        "videoQuality": "max",
+        "tiktokH265": True,
+        "audioFormat": "best",
     }
 
 def download_file(url, filename, max_retries=5):
@@ -171,37 +163,45 @@ def main():
         if response.status_code == 200:
             data = response.json()
             logging.info(f"Response for {video_link}: {data}")
-            if data.get("status") == "stream" and data.get("url"):
-                download_url = data.get("url")
+
+            status = data.get("status")
+
+            if status in ["redirect", "tunnel"]:
+                download_url = data["url"]
                 filename = os.path.join(DOWNLOAD_DIR, f"{count}.mp4")
                 if not download_file(download_url, filename):
-                    logging.info("Retrying with a new download link for video.")
-                    response = requests.post(COBALT_API_URL, headers=HEADERS, data=json.dumps(payload))
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data.get("status") == "stream" and data.get("url"):
-                            download_url = data.get("url")
-                            if not download_file(download_url, filename):
-                                logging.error(f"Failed to download video: {video_link}")
+                    logging.error(f"Failed to download video: {video_link}")
+            elif status == "picker":
+                picker = data.get("picker", [])
+                if picker and picker[0].get("type") == "photo":
+                    image_urls = [item["url"] for item in picker]
+                    audio_url = data.get("audio")
+                    if image_urls:
+                        os.makedirs(IMG_DIR, exist_ok=True)
+                        image_files = download_images(image_urls, IMG_DIR)
+                        if audio_url:
+                            audio_file = os.path.join(IMG_DIR, "audio.mp3")
+                            if not download_file(audio_url, audio_file):
+                                logging.warning("The audio for this slideshow no longer exists, using default audio")
+                                shutil.copy('default.mp3', audio_file)
+                        else:
+                            logging.warning("No audio found in picker response, using default audio")
+                            audio_file = 'default.mp3'
+                        filename = os.path.join(DOWNLOAD_DIR, f"{count}.mp4")
+                        create_slideshow(image_files, audio_file, filename, DURATION_PER_IMAGE)
+                        shutil.rmtree(IMG_DIR)
                     else:
-                        logging.error(f"Failed to download video: {video_link}")
-            elif data.get("status") == "picker" and data.get("pickerType") == "images":
-                image_urls = [item["url"] for item in data.get("picker", [])]
-                audio_url = data.get("audio")
-                if image_urls and audio_url:
-                    os.makedirs(IMG_DIR, exist_ok=True)
-                    image_files = download_images(image_urls, IMG_DIR)
-                    audio_file = os.path.join(IMG_DIR, "audio.mp3")
-                    if not download_file(audio_url, audio_file):
-                        logging.warning("The audio for this slideshow no longer exists, using default audio")
-                        shutil.copy('default.mp3', audio_file)
-                    filename = os.path.join(DOWNLOAD_DIR, f"{count}.mp4")
-                    create_slideshow(image_files, audio_file, filename, DURATION_PER_IMAGE)
-                    shutil.rmtree(IMG_DIR)
+                        logging.error(f"No images found in picker response for {video_link}")
+                else:
+                    logging.error(f"Picker response contains unsupported media types for {video_link}")
+            elif status == "error":
+                error_info = data.get("error", {})
+                logging.error(f"Error in response for {video_link}: {error_info}")
             else:
-                logging.error(f"Error in response for {video_link}: {data}")
+                logging.error(f"Unknown status '{status}' in response for {video_link}")
         else:
-            logging.error(f"The following video no longer exists {video_link}: {response.status_code}")
+            logging.error(f"Failed to process video {video_link}: HTTP {response.status_code}")
+            logging.error(f"Response: {response.text}")
 
         time.sleep(RETRY_DELAY)
 
